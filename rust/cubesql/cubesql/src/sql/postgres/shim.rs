@@ -501,148 +501,6 @@ impl AsyncPostgresShim {
         Ok(())
     }
 
-    async fn write_data_frame(
-        &mut self,
-        frame: Arc<DataFrame>,
-        description: bool,
-        format: Format,
-    ) -> Result<u32, CubeError> {
-        if description {
-            let mut fields = Vec::new();
-
-            for column in frame.get_columns().iter() {
-                fields.push(protocol::RowDescriptionField::new(
-                    column.get_name(),
-                    PgType::get_by_tid(PgTypeId::TEXT),
-                ))
-            }
-
-            self.write(protocol::RowDescription::new(fields)).await?;
-        }
-
-        let mut total: u32 = 0;
-        let mut batch_writer = BatchWriter::new(format);
-
-        for row in frame.get_rows() {
-            for value in row.values() {
-                match value {
-                    TableValue::Null => batch_writer.write_value::<Option<bool>>(None)?,
-                    TableValue::String(v) => batch_writer.write_value(v.clone())?,
-                    TableValue::Int64(v) => batch_writer.write_value(*v)?,
-                    TableValue::Boolean(v) => batch_writer.write_value(*v)?,
-                    TableValue::Float64(v) => batch_writer.write_value(*v)?,
-                    TableValue::List(v) => batch_writer.write_value(v.clone())?,
-                    // @todo Support value
-                    TableValue::Timestamp(v) => batch_writer.write_value(v.to_string())?,
-                };
-            }
-
-            total += 1;
-            batch_writer.end_row()?;
-        }
-
-        buffer::write_direct(&mut self.socket, batch_writer).await?;
-
-        Ok(total)
-    }
-
-    async fn write_stream(
-        &mut self,
-        mut stream: SendableRecordBatchStream,
-        description: bool,
-        format: Format,
-        max_rows: usize,
-    ) -> Result<u32, CubeError> {
-        let mut total: u32 = 0;
-        let mut first = true;
-
-        loop {
-            match stream.next().await {
-                None => {
-                    return Ok(total);
-                }
-                Some(res) => match res {
-                    Ok(batch) => {
-                        if max_rows != 0 && (total as usize + batch.num_rows()) > max_rows {
-                            self.write(protocol::ErrorResponse::new(
-                                protocol::ErrorSeverity::Error,
-                                protocol::ErrorCode::InternalError,
-                                "Execute with limited rows is not supported".to_string(),
-                            ))
-                            .await?;
-
-                            return Ok(0);
-                        }
-
-                        let frame = Arc::new(batch_to_dataframe(&vec![batch])?);
-                        total += self
-                            .write_data_frame(frame, description && first, format)
-                            .await?;
-
-                        first = false;
-                    }
-                    Err(err) => {
-                        error!("Error during processing: {}", err);
-
-                        self.write(protocol::ErrorResponse::new(
-                            protocol::ErrorSeverity::Error,
-                            protocol::ErrorCode::DataException,
-                            err.to_string(),
-                        ))
-                        .await?;
-
-                        return Err(err.into());
-                    }
-                },
-            }
-        }
-    }
-
-    async fn execute_plan(
-        &mut self,
-        plan: QueryPlan,
-        description: bool,
-        format: Format,
-        max_rows: usize,
-    ) -> Result<(), CubeError> {
-        match plan {
-            QueryPlan::MetaOk(_, completion) => {
-                self.write(completion.to_pg_command()).await?;
-            }
-            QueryPlan::MetaTabular(_, data_frame) => {
-                if max_rows != 0 && data_frame.len() > max_rows {
-                    self.write(protocol::ErrorResponse::new(
-                        protocol::ErrorSeverity::Error,
-                        protocol::ErrorCode::InternalError,
-                        "Execute with limited rows is not supported".to_string(),
-                    ))
-                    .await?;
-
-                    return Ok(());
-                }
-
-                let total_rows = self
-                    .write_data_frame(data_frame, description, format)
-                    .await?;
-
-                self.write(protocol::CommandComplete::Select(total_rows))
-                    .await?;
-            }
-            QueryPlan::DataFusionSelect(_, plan, ctx) => {
-                let df = DFDataFrame::new(ctx.state, &plan);
-                let stream = df.execute_stream().await?;
-                let total_rows = self
-                    .write_stream(stream, description, format, max_rows)
-                    .await?;
-
-                self.write(protocol::CommandComplete::Select(total_rows))
-                    .await?;
-            }
-        };
-
-        Ok(())
-    }
-
     pub async fn execute_query(&mut self, query: &str) -> Result<(), CubeError> {
         let meta = self
             .session
@@ -652,7 +510,29 @@ impl AsyncPostgresShim {
             .await?;
 
         let plan = convert_sql_to_cube_query(&query.to_string(), meta, self.session.clone())?;
-        self.execute_plan(plan, true, Format::Text, 0).await
+
+        let description = self.query_plan_to_row_description(&plan).await?;
+        match description.len() {
+            0 => self.write(protocol::NoData::new()).await?,
+            _ => {
+                self.write(protocol::RowDescription::new(description))
+                    .await?
+            }
+        };
+
+        // Re-usage of Portal functionality
+        let mut portal = Portal::new(plan, Format::Text, None);
+
+        let mut writer = BatchWriter::new(portal.get_format());
+        let completion = portal.execute(&mut writer, 0).await?;
+
+        if writer.has_data() {
+            buffer::write_direct(&mut self.socket, writer).await?;
+        };
+
+        self.write(completion).await?;
+
+        Ok(())
     }
 
     pub async fn process_query(&mut self, query: String) -> Result<(), Error> {

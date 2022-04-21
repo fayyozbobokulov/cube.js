@@ -3,7 +3,7 @@ use crate::sql::protocol::{CommandComplete, Format};
 use datafusion::arrow::record_batch::RecordBatch;
 use sqlparser::ast;
 use std::fmt;
-use std::fmt::Formatter;
+use std::fmt::{format, Formatter};
 use std::sync::Arc;
 
 use super::protocol::{ParameterDescription, RowDescription};
@@ -50,7 +50,7 @@ impl fmt::Debug for PreparedState {
 #[derive(Debug)]
 pub struct InExecutionFrameState {
     // Format which is used to return data
-    batch: Arc<DataFrame>,
+    batch: DataFrame,
 }
 
 pub struct InExecutionStreamState {
@@ -66,12 +66,6 @@ impl InExecutionStreamState {
             stream,
             unused: None,
         }
-    }
-}
-
-impl InExecutionStreamState {
-    pub fn pub_unused(&mut self, batch: RecordBatch) {
-        self.unused = Some(batch);
     }
 }
 
@@ -130,10 +124,11 @@ impl Portal {
         max_rows: usize,
     ) -> Result<(PortalState, CommandComplete), CubeError> {
         let rows_read = frame_state.batch.len();
-        if max_rows > 0 && rows_read < max_rows {
-            Err(CubeError::internal(
-                "Cursor with limited max_rows for DataFrame is not supported".to_string(),
-            ))
+        if max_rows > 0 && rows_read > 0 && rows_read > max_rows {
+            Err(CubeError::internal(format!(
+                "Cursor with limited max_rows: {} for DataFrame is not supported",
+                max_rows
+            )))
         } else {
             self.write_dataframe_to_writer(
                 writer,
@@ -151,7 +146,7 @@ impl Portal {
     fn write_dataframe_to_writer(
         &self,
         writer: &mut BatchWriter,
-        frame: Arc<DataFrame>,
+        frame: DataFrame,
         rows_to_read: usize,
     ) -> Result<(), CubeError> {
         for (idx, row) in frame.get_rows().iter().enumerate() {
@@ -209,7 +204,7 @@ impl Portal {
 
         // TODO: Split doesn't split batches, it copy the part, lets dont convert whole batch to dataframe
         let frame = batch_to_dataframe(&vec![batch_for_write])?;
-        self.write_dataframe_to_writer(writer, Arc::new(frame), rows_to_read)?;
+        self.write_dataframe_to_writer(writer, frame, rows_to_read)?;
 
         Ok(unused)
     }
@@ -274,7 +269,7 @@ impl Portal {
                         Ok(completion.clone().to_pg_command())
                     }
                     QueryPlan::MetaTabular(_, batch) => {
-                        let new_state = InExecutionFrameState { batch };
+                        let new_state = InExecutionFrameState { batch: *batch };
                         let (next_state, complete) = self
                             .hand_execution_frame_state(writer, new_state, max_rows)
                             .await?;
@@ -328,7 +323,7 @@ mod tests {
     use crate::sql::extended::{
         InExecutionFrameState, InExecutionStreamState, Portal, PortalState,
     };
-    use crate::sql::protocol::Format;
+    use crate::sql::protocol::{CommandComplete, Format};
     use crate::sql::writer::BatchWriter;
     use crate::CubeError;
 
@@ -338,36 +333,60 @@ mod tests {
     use crate::sql::{ColumnFlags, ColumnType};
     use std::sync::Arc;
 
-    fn generate_testing_data_frame(cnt: usize) -> Arc<DataFrame> {
+    fn generate_testing_data_frame(cnt: usize) -> DataFrame {
         let mut rows = vec![];
 
         for i in 0..cnt {
             rows.push(Row::new(vec![TableValue::String("Row1".to_string())]));
         }
 
-        Arc::new(DataFrame::new(
+        DataFrame::new(
             vec![Column::new(
                 "Col1".to_string(),
                 ColumnType::String,
                 ColumnFlags::empty(),
             )],
             rows,
-        ))
+        )
     }
 
     #[tokio::test]
-    async fn test_portal_legacy_dataframe_limited() -> Result<(), CubeError> {
+    async fn test_portal_legacy_dataframe_limited_more() -> Result<(), CubeError> {
         let mut writer = BatchWriter::new(Format::Binary);
 
         let mut portal = Portal {
             format: Format::Binary,
             state: Some(PortalState::InExecutionFrame(InExecutionFrameState {
-                batch: generate_testing_data_frame(2),
+                batch: generate_testing_data_frame(3),
             })),
         };
 
-        portal.execute(&mut writer, 1).await?;
-        assert_eq!(1, writer.num_rows());
+        portal.execute(&mut writer, 10).await?;
+        // Batch will not be split, because clients wants more rows then in batch
+        assert_eq!(3, writer.num_rows());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_portal_legacy_dataframe_limited_less() -> Result<(), CubeError> {
+        let mut writer = BatchWriter::new(Format::Binary);
+
+        let mut portal = Portal {
+            format: Format::Binary,
+            state: Some(PortalState::InExecutionFrame(InExecutionFrameState {
+                batch: generate_testing_data_frame(3),
+            })),
+        };
+
+        let res = portal.execute(&mut writer, 1).await;
+        match res {
+            Ok(_) => panic!("must panic"),
+            Err(e) => assert_eq!(
+                e.message,
+                "Cursor with limited max_rows: 1 for DataFrame is not supported"
+            ),
+        }
 
         Ok(())
     }

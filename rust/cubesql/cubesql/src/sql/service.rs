@@ -4,5 +4,5 @@ use super::{dataframe, StatusFlags};
 
 pub enum QueryResponse {
     Ok(StatusFlags),
-    ResultSet(StatusFlags, Arc<dataframe::DataFrame>),
+    ResultSet(StatusFlags, Box<dataframe::DataFrame>),
 }

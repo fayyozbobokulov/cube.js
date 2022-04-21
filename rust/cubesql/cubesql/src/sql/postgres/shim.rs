@@ -275,7 +275,7 @@ impl AsyncPostgresShim {
             Some(portal) => match portal {
                 // We use None for Portal on empty query
                 None => self.write(protocol::NoData::new()).await,
-                Some(named) => match named.description.clone() {
+                Some(named) => match named.get_description().clone() {
                     // If Query doesnt return data, no fields in response.
                     None => self.write(protocol::NoData::new()).await,
                     Some(packet) => self.write(packet).await,
@@ -345,34 +345,24 @@ impl AsyncPostgresShim {
     }
 
     pub async fn execute(&mut self, execute: protocol::Execute) -> Result<(), Error> {
-        match self.portals.get(&execute.portal) {
+        match self.portals.get_mut(&execute.portal) {
             Some(portal) => match portal {
                 // We use None for Statement on empty query
                 None => {
                     self.write(protocol::EmptyQueryResponse::new()).await?;
                 }
                 Some(portal) => {
-                    // TODO: I will rewrite this code later, it's just a prototype
-                    #[allow(mutable_borrow_reservation_conflict)]
-                    match self
-                        .execute_plan(
-                            portal.plan.clone(),
-                            false,
-                            portal.format,
-                            execute.max_rows as usize,
-                        )
+                    let mut writer = BatchWriter::new(portal.get_format());
+                    let completion = portal
+                        .execute(&mut writer, execute.max_rows as usize)
                         .await
-                    {
-                        Err(e) => {
-                            self.write(protocol::ErrorResponse::new(
-                                protocol::ErrorSeverity::Error,
-                                protocol::ErrorCode::InternalError,
-                                e.message,
-                            ))
-                            .await?;
-                        }
-                        Ok(_) => {}
+                        .unwrap();
+
+                    if writer.has_data() {
+                        buffer::write_direct(&mut self.socket, writer).await?
                     }
+
+                    self.write(completion).await?;
                 }
             },
             None => {
@@ -407,13 +397,6 @@ impl AsyncPostgresShim {
                 convert_statement_to_cube_query(&prepared_statement, meta, self.session.clone())
                     .map_err(|err| Error::new(ErrorKind::Other, err.to_string()))?;
 
-            let format = body
-                .result_formats
-                .first()
-                .clone()
-                .unwrap_or(&Format::Text)
-                .clone();
-
             let fields = self.query_plan_to_row_description(&plan).await?;
             let description = if fields.len() > 0 {
                 Some(protocol::RowDescription::new(
@@ -423,11 +406,9 @@ impl AsyncPostgresShim {
                 None
             };
 
-            Some(Portal {
-                plan,
-                format,
-                description,
-            })
+            let format = body.result_formats.first().unwrap_or(&Format::Text).clone();
+
+            Some(Portal::new(plan, format, description))
         } else {
             None
         };
